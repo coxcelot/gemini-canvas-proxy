@@ -1,0 +1,1140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Perchance Generator Proxy</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Lucide Icons -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/lucide/0.263.0/lucide.min.js"></script>
+    <!-- JSZip for Extension Generation -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@300;400;500;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; background-color: #09090b; color: #f4f4f5; }
+        .mono { font-family: 'JetBrains Mono', monospace; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #18181b; }
+        ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #52525b; }
+        .scroll-hide::-webkit-scrollbar { width: 3px; height: 3px; }
+        .accordion-content { transition: max-height 0.3s cubic-bezier(0.4,0,0.2,1), opacity 0.2s ease; }
+        .dot-flashing { position:relative; width:6px; height:6px; border-radius:5px; background-color:#a1a1aa; animation:dot-flashing 1s infinite linear alternate; animation-delay:.5s; }
+        .dot-flashing::before,.dot-flashing::after { content:''; display:inline-block; position:absolute; top:0; }
+        .dot-flashing::before { left:-10px; width:6px; height:6px; border-radius:5px; background-color:#a1a1aa; animation:dot-flashing 1s infinite alternate; animation-delay:0s; }
+        .dot-flashing::after { left:10px; width:6px; height:6px; border-radius:5px; background-color:#a1a1aa; animation:dot-flashing 1s infinite alternate; animation-delay:1s; }
+        @keyframes dot-flashing { 0% { background-color:#a1a1aa; } 50%,100% { background-color:transparent; } }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col bg-[#09090b]">
+
+<!-- ═══════════════════════════════════════════════════════════════════════
+     PERCHANCE RUNTIME LAYER
+     ── Implements the full Perchance generator iframe transport protocol:
+        • PERCH.parentWindow  – reference to the embedding parent window
+        • window.addEventListener("message", …)  – command dispatcher
+        • initWithDataFromParentWindow  – reload-with-data path
+        • sessionStorage reload-marker helpers  – prevent init loops
+        • Service-worker debug registration  – mirrors perchance.org SW setup
+     The rest of the file is the proxy UI (rebranded from the Gemini canvas
+     proxy) that drives the LLM backend chosen by the generator config.
+═══════════════════════════════════════════════════════════════════════ -->
+<script>
+// ════════════════════════════════════════════════════════════════
+// 0.  PERCH NAMESPACE  (mirrors perchance.org runtime globals)
+// ════════════════════════════════════════════════════════════════
+const PERCH = (() => {
+    // parentWindow: the window that embedded us (or null when top-level).
+    // In Perchance, every generator iframe receives its config payload
+    // via postMessage from parentWindow before the generator "runs".
+    const parentWindow = (window.self !== window.top) ? window.parent : null;
+
+    // Utility: send a message up to the embedding parent, exactly as
+    // Perchance generators do when they want to notify the shell.
+    function notifyParent(type, payload) {
+        if (!parentWindow) return;
+        parentWindow.postMessage({ source: 'perchance-generator', type, payload }, '*');
+    }
+
+    // Utility: broadcast to every sub-frame we own (mirrors the inverse path
+    // used by the Perchance shell when it needs to push config down).
+    function broadcastToChildren(type, payload) {
+        for (const frame of Array.from(document.querySelectorAll('iframe'))) {
+            try { frame.contentWindow.postMessage({ source: 'perchance-shell', type, payload }, '*'); }
+            catch (_) {}
+        }
+    }
+
+    return { parentWindow, notifyParent, broadcastToChildren };
+})();
+
+// ════════════════════════════════════════════════════════════════
+// 1.  SESSION-STORAGE RELOAD-MARKER HELPERS
+//     Perchance uses these to break the chicken-and-egg problem of
+//     "we need data from the parent before we can render, but the
+//     parent can only send data after our document is ready."
+//     Strategy: store the incoming config in sessionStorage, then
+//     reload; on the reloaded page we read the marker and skip the
+//     postMessage wait entirely.
+// ════════════════════════════════════════════════════════════════
+const PERCH_SS = (() => {
+    const MARKER_KEY   = '__perchance_reload_marker__';
+    const DATA_KEY     = '__perchance_init_data__';
+
+    function setReloadMarker(data) {
+        try {
+            sessionStorage.setItem(MARKER_KEY, '1');
+            sessionStorage.setItem(DATA_KEY, JSON.stringify(data));
+        } catch (_) {}
+    }
+
+    function clearReloadMarker() {
+        try {
+            sessionStorage.removeItem(MARKER_KEY);
+            sessionStorage.removeItem(DATA_KEY);
+        } catch (_) {}
+    }
+
+    function hasReloadMarker() {
+        try { return sessionStorage.getItem(MARKER_KEY) === '1'; }
+        catch (_) { return false; }
+    }
+
+    function getStoredData() {
+        try {
+            const raw = sessionStorage.getItem(DATA_KEY);
+            return raw ? JSON.parse(raw) : null;
+        } catch (_) { return null; }
+    }
+
+    return { setReloadMarker, clearReloadMarker, hasReloadMarker, getStoredData };
+})();
+
+// ════════════════════════════════════════════════════════════════
+// 2.  SERVICE-WORKER DEBUG REGISTRATION
+//     Perchance registers a SW on generators so that:
+//       (a) The generator can work partially offline.
+//       (b) The SW intercepts fetch calls and can log / modify them
+//           during development (debug mode).
+//     We register an inline SW blob here.  On a real Perchance host
+//     this would be /sw.js; we synthesise it so the proxy page is
+//     self-contained and deployable as a single HTML file.
+// ════════════════════════════════════════════════════════════════
+(async function registerPerchanceSW() {
+    if (!('serviceWorker' in navigator)) {
+        console.info('[PERCH SW] Service workers not supported in this context.');
+        return;
+    }
+    try {
+        // Check if we already have an active registration to avoid
+        // re-registering on the initWithDataFromParentWindow reload.
+        const existing = await navigator.serviceWorker.getRegistration('./');
+        if (existing) {
+            console.info('[PERCH SW] Existing registration found:', existing.scope);
+            return;
+        }
+
+        // Build the SW source inline and turn it into an object-URL.
+        const swSource = `
+// Perchance generator debug service worker (synthesised)
+const CACHE_NAME = 'perchance-proxy-v1';
+
+self.addEventListener('install', (e) => {
+    console.log('[PERCH SW] Installing…');
+    self.skipWaiting();
+});
+
+self.addEventListener('activate', (e) => {
+    console.log('[PERCH SW] Activated.');
+    e.waitUntil(self.clients.claim());
+});
+
+// Intercept fetches – pass-through by default, log in debug mode.
+self.addEventListener('fetch', (e) => {
+    const url = new URL(e.request.url);
+    // Let CDN / extension / external requests through untouched.
+    if (url.origin !== self.location.origin) return;
+    // For same-origin requests, network-first with a cache fallback.
+    e.respondWith(
+        fetch(e.request).then(res => {
+            const clone = res.clone();
+            caches.open(CACHE_NAME).then(c => c.put(e.request, clone));
+            return res;
+        }).catch(() => caches.match(e.request))
+    );
+});
+
+// Listen for messages from the main thread (e.g. cache-bust commands).
+self.addEventListener('message', (e) => {
+    if (e.data && e.data.type === 'SKIP_WAITING') self.skipWaiting();
+    if (e.data && e.data.type === 'CLEAR_CACHE') {
+        caches.delete(CACHE_NAME).then(() => {
+            e.source && e.source.postMessage({ type: 'CACHE_CLEARED' });
+        });
+    }
+});
+`;
+        const blob   = new Blob([swSource], { type: 'application/javascript' });
+        const swUrl  = URL.createObjectURL(blob);
+        const reg    = await navigator.serviceWorker.register(swUrl, { scope: './' });
+        console.info('[PERCH SW] Registered. Scope:', reg.scope);
+
+        // Listen for SW messages back to the page.
+        navigator.serviceWorker.addEventListener('message', (e) => {
+            if (e.data?.type === 'CACHE_CLEARED') {
+                console.info('[PERCH SW] Cache cleared successfully.');
+            }
+        });
+    } catch (err) {
+        // SW registration is best-effort; don't break the page.
+        console.warn('[PERCH SW] Registration failed (expected in sandboxed iframes):', err.message);
+    }
+})();
+
+// ════════════════════════════════════════════════════════════════
+// 3.  initWithDataFromParentWindow
+//     Called when the parent passes generator-config data via
+//     postMessage.  In Perchance this triggers a page reload so that
+//     the generator script can access a stable `generatorData` global
+//     during its initial synchronous execution rather than having to
+//     wait for an async message.
+// ════════════════════════════════════════════════════════════════
+function initWithDataFromParentWindow(data) {
+    console.info('[PERCH] initWithDataFromParentWindow called with:', data);
+
+    // Store the config and a reload marker, then reload.
+    // The reloaded page will pick it up via PERCH_SS.getStoredData()
+    // in the DOMContentLoaded handler below (step 4).
+    PERCH_SS.setReloadMarker(data);
+
+    // Notify the parent that we are about to reload so it doesn't
+    // resend the same message.
+    PERCH.notifyParent('generator-reloading', {});
+
+    window.location.reload();
+}
+
+// Expose on window so external scripts / the parent can call it directly.
+window.initWithDataFromParentWindow = initWithDataFromParentWindow;
+
+// ════════════════════════════════════════════════════════════════
+// 4.  COMMAND-HANDLER  —  window.addEventListener("message", …)
+//     The central dispatcher for all inter-frame messages.
+//     Perchance defines a small command vocabulary; we handle every
+//     known command and log unknown ones for debugging.
+// ════════════════════════════════════════════════════════════════
+window.addEventListener('message', (event) => {
+    // ── Security: only accept structured objects.
+    if (!event.data || typeof event.data !== 'object') return;
+
+    const { source, type, action, payload } = event.data;
+
+    // ── Route 1: Messages from the Perchance shell / parent page.
+    if (source === 'perchance-shell') {
+        switch (type) {
+            // Parent is delivering generator-init config before first render.
+            case 'init-data':
+                initWithDataFromParentWindow(payload || {});
+                break;
+
+            // Parent is asking us to re-roll / regenerate output.
+            case 'generate':
+                if (typeof window.generate === 'function') {
+                    window.generate();
+                }
+                break;
+
+            // Parent is injecting a user-defined variable override.
+            case 'set-variable':
+                if (payload && typeof payload.key === 'string') {
+                    window[payload.key] = payload.value;
+                }
+                break;
+
+            // Parent requests the current generator state (for save/export).
+            case 'get-state':
+                PERCH.notifyParent('state', {
+                    output: document.getElementById('output')?.innerText || '',
+                    timestamp: Date.now()
+                });
+                break;
+
+            // Flush the SW cache (debug helper).
+            case 'clear-cache':
+                if (navigator.serviceWorker?.controller) {
+                    navigator.serviceWorker.controller.postMessage({ type: 'CLEAR_CACHE' });
+                }
+                break;
+
+            default:
+                console.debug('[PERCH] Unknown shell command:', type, payload);
+        }
+        return;
+    }
+
+    // ── Route 2: Messages from the bridge extension content-script
+    //    (unchanged protocol from the original canvas proxy —
+    //     source = 'CONTENT_SCRIPT_INBOUND').
+    if (source === 'CONTENT_SCRIPT_INBOUND') {
+        const { action: act, payload: pl } = event.data;
+        if (act === 'WS_STATUS') {
+            if (pl.status === 'CONNECTED') {
+                bridge.onExtensionConnected();
+            } else if (pl.status === 'DISCONNECTED' || pl.status === 'ERROR') {
+                bridge.onExtensionDisconnected(pl);
+            }
+        } else if (act === 'WS_MESSAGE') {
+            bridge.onWsMessage(pl);
+        }
+        return;
+    }
+
+    // ── Route 3: Perchance generator-to-shell messages originating
+    //    from a child iframe that WE are hosting.
+    if (source === 'perchance-generator') {
+        console.debug('[PERCH] Child generator event:', type, payload);
+        return;
+    }
+});
+
+// ════════════════════════════════════════════════════════════════
+// 5.  BOOT SEQUENCE  — read reload-marker on DOMContentLoaded
+// ════════════════════════════════════════════════════════════════
+document.addEventListener('DOMContentLoaded', () => {
+    if (PERCH_SS.hasReloadMarker()) {
+        const storedData = PERCH_SS.getStoredData();
+        console.info('[PERCH] Resuming after initWithDataFromParentWindow reload. Data:', storedData);
+        PERCH_SS.clearReloadMarker();
+
+        // Apply any stored generator config to the proxy UI.
+        if (storedData?.apiKey) {
+            const keyInput = document.getElementById('api-key');
+            if (keyInput) keyInput.value = storedData.apiKey;
+        }
+        if (storedData?.edgeUrl) {
+            const urlInput = document.getElementById('edge-url');
+            if (urlInput) urlInput.value = storedData.edgeUrl;
+        }
+        if (storedData?.model) {
+            window.__perchance_model__ = storedData.model;
+        }
+
+        // Signal to any embedding parent that we are ready.
+        PERCH.notifyParent('generator-ready', { reloadedWithData: true });
+    } else {
+        // First load — notify parent that we are ready to receive init-data.
+        PERCH.notifyParent('generator-ready', { reloadedWithData: false });
+    }
+
+    renderIcons();
+});
+</script>
+
+<!-- ══════════════════════════════════════════
+     PROXY UI
+══════════════════════════════════════════ -->
+<header class="h-16 border-b border-zinc-800 flex items-center justify-between px-6 bg-[#09090b]/80 backdrop-blur-md z-40 shrink-0 sticky top-0">
+    <div class="flex items-center gap-3">
+        <div class="w-8 h-8 bg-violet-600 rounded-lg flex items-center justify-center shadow-lg shadow-violet-500/20">
+            <i data-lucide="shuffle" class="w-5 h-5 text-white"></i>
+        </div>
+        <div>
+            <span class="font-bold tracking-tight text-sm md:text-base">Perchance Generator Proxy</span>
+            <span class="ml-2 text-[10px] bg-violet-500/10 text-violet-400 border border-violet-500/20 px-2 py-0.5 rounded font-mono hidden sm:inline-block">transport/runtime layer active</span>
+        </div>
+    </div>
+    <div class="flex items-center gap-6">
+        <div class="flex flex-col items-end mr-2">
+            <span class="text-[9px] text-zinc-500 font-bold uppercase tracking-widest hidden sm:block">Bridge Status</span>
+            <div class="flex gap-2 items-center">
+                <span id="header-status-dot" class="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
+                <span id="header-status-text" class="text-xs text-zinc-300 mono">Disconnected</span>
+            </div>
+        </div>
+    </div>
+</header>
+
+<main class="flex-1 flex flex-col lg:flex-row w-full max-w-[100vw]">
+
+    <!-- Left Column -->
+    <section class="w-full lg:w-[450px] lg:h-[calc(100vh-64px)] border-r border-zinc-800 bg-[#111114] flex flex-col shrink-0 overflow-y-auto">
+        <div class="p-4 space-y-4">
+
+            <!-- PERCH Runtime Status Card -->
+            <div class="border border-violet-500/30 bg-violet-950/10 rounded-xl p-4 space-y-2 text-xs">
+                <div class="flex items-center gap-2 mb-1">
+                    <i data-lucide="cpu" class="w-4 h-4 text-violet-400"></i>
+                    <span class="text-[10px] font-black uppercase tracking-widest text-violet-300">Perchance Runtime Status</span>
+                </div>
+                <div class="grid grid-cols-2 gap-2">
+                    <div class="bg-zinc-900/60 rounded-lg p-2 border border-zinc-800">
+                        <span class="text-[9px] text-zinc-500 uppercase block">parentWindow</span>
+                        <span id="rt-parent" class="text-zinc-300 mono text-[10px]">—</span>
+                    </div>
+                    <div class="bg-zinc-900/60 rounded-lg p-2 border border-zinc-800">
+                        <span class="text-[9px] text-zinc-500 uppercase block">Reload Marker</span>
+                        <span id="rt-marker" class="text-zinc-300 mono text-[10px]">none</span>
+                    </div>
+                    <div class="bg-zinc-900/60 rounded-lg p-2 border border-zinc-800">
+                        <span class="text-[9px] text-zinc-500 uppercase block">Service Worker</span>
+                        <span id="rt-sw" class="text-zinc-300 mono text-[10px]">checking…</span>
+                    </div>
+                    <div class="bg-zinc-900/60 rounded-lg p-2 border border-zinc-800">
+                        <span class="text-[9px] text-zinc-500 uppercase block">Active Model</span>
+                        <span id="rt-model" class="text-zinc-300 mono text-[10px]">default</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 1a. Google Colab -->
+            <div class="border border-indigo-500/40 bg-indigo-950/10 rounded-xl overflow-hidden shadow-lg shadow-indigo-950/20">
+                <button onclick="toggleAccordion('colab-accordion')" class="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-indigo-500/5 transition-all">
+                    <div class="flex items-center gap-3">
+                        <i data-lucide="play-circle" class="w-4 h-4 text-indigo-400"></i>
+                        <span class="text-xs font-black uppercase tracking-widest text-indigo-300">1a. Google Colab (Recommended)</span>
+                    </div>
+                    <i id="colab-accordion-arrow" data-lucide="chevron-down" class="w-4 h-4 text-zinc-500 transition-transform duration-300 rotate-180"></i>
+                </button>
+                <div id="colab-accordion-content" class="accordion-content border-t border-zinc-800/80 px-5 py-4 space-y-4 text-xs text-zinc-400">
+                    <p class="leading-relaxed text-zinc-300">Run the relay bridge inside <a href="https://colab.research.google.com" target="_blank" class="text-indigo-400 hover:underline">Google Colab</a>. Copy the URL it prints and paste it in Step 3.</p>
+                    <div class="relative bg-zinc-950 rounded-xl border border-zinc-800 p-4">
+                        <div class="flex justify-between items-center mb-2 pb-2 border-b border-zinc-800/60">
+                            <span class="text-[9px] font-mono text-zinc-500">colab_relay.py</span>
+                            <button onclick="copyColabCode()" class="px-2.5 py-1 bg-zinc-900 hover:bg-zinc-800 text-zinc-300 hover:text-white rounded border border-zinc-800 text-[10px] font-bold transition-all flex items-center gap-1.5 active:scale-[0.97]">
+                                <i data-lucide="copy" class="w-3 h-3"></i> Copy
+                            </button>
+                        </div>
+                        <pre id="colab-code-text" class="text-[10px] font-mono leading-relaxed overflow-x-auto max-h-40 text-zinc-400 scroll-hide select-all whitespace-pre">!pkill -9 -f cloudflared
+!pkill -9 -f uvicorn
+!pip install -q fastapi uvicorn websockets
+!wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+!chmod +x cloudflared
+
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+import asyncio, json, subprocess, time, re, threading
+
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+generator_socket = None
+pending_requests = {}
+req_id = 0
+
+@app.get("/")
+async def root():
+    return {"status": "Perchance Generator Proxy Bridge Active"}
+
+@app.websocket("/")
+async def websocket_endpoint(websocket: WebSocket):
+    global generator_socket
+    await websocket.accept()
+    generator_socket = websocket
+    try:
+        while True:
+            data = await websocket.receive_text()
+            msg = json.loads(data)
+            msg_id = msg.get("id")
+            if msg_id in pending_requests:
+                pending_requests[msg_id].set_result(msg.get("body"))
+    except WebSocketDisconnect:
+        if generator_socket == websocket:
+            generator_socket = None
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    global generator_socket, req_id
+    if not generator_socket:
+        return Response(content=json.dumps({"error": "Generator offline"}), status_code=503, media_type="application/json")
+    body = await request.json()
+    req_id += 1
+    current_id = req_id
+    loop = asyncio.get_event_loop()
+    future = loop.create_future()
+    pending_requests[current_id] = future
+    await generator_socket.send_text(json.dumps({"id": current_id, "body": body}))
+    try:
+        return await asyncio.wait_for(future, timeout=30.0)
+    except asyncio.TimeoutError:
+        return Response(content=json.dumps({"error": "Timeout"}), status_code=504, media_type="application/json")
+    finally:
+        pending_requests.pop(current_id, None)
+
+tunnel_process = subprocess.Popen(["./cloudflared", "tunnel", "--url", "http://localhost:8000"],
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+tunnel_url = None
+time.sleep(3)
+for _ in range(30):
+    line = tunnel_process.stdout.readline()
+    match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", line)
+    if match:
+        tunnel_url = match.group(0)
+        break
+    time.sleep(0.2)
+if tunnel_url:
+    print("=" * 60)
+    print(f"Bridge URL: {tunnel_url.replace('https://', '')}")
+    print("Paste the above into Step 3.")
+    print("=" * 60)
+
+config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="warning")
+server = uvicorn.Server(config=config)
+threading.Thread(target=server.run, daemon=True).start()
+while not server.started:
+    time.sleep(0.1)
+print("Server online.")</pre>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 1b. Local Server -->
+            <div class="border border-zinc-800 bg-[#18181b]/50 rounded-xl overflow-hidden">
+                <button onclick="toggleAccordion('local-accordion')" class="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-zinc-800/20 transition-all">
+                    <div class="flex items-center gap-3">
+                        <i data-lucide="terminal" class="w-4 h-4 text-cyan-400"></i>
+                        <span class="text-xs font-black uppercase tracking-widest text-zinc-300">1b. Local Server (Offline)</span>
+                    </div>
+                    <i id="local-accordion-arrow" data-lucide="chevron-down" class="w-4 h-4 text-zinc-500 transition-transform duration-300"></i>
+                </button>
+                <div id="local-accordion-content" class="accordion-content border-t border-zinc-800/80 px-5 py-4 space-y-4 text-xs text-zinc-400 hidden">
+                    <div class="relative bg-zinc-950 rounded-xl border border-zinc-800 p-4">
+                        <div class="flex justify-between items-center mb-2 pb-2 border-b border-zinc-800/60">
+                            <span class="text-[9px] font-mono text-zinc-500">server.js</span>
+                            <button onclick="copyLocalServerCode()" class="px-2.5 py-1 bg-zinc-900 hover:bg-zinc-800 text-zinc-300 hover:text-white rounded border border-zinc-800 text-[10px] font-bold transition-all flex items-center gap-1.5 active:scale-[0.97]">
+                                <i data-lucide="copy" class="w-3 h-3"></i> Copy
+                            </button>
+                        </div>
+                        <pre id="local-server-code-text" class="text-[10px] font-mono leading-relaxed overflow-x-auto max-h-36 text-zinc-400 scroll-hide select-all whitespace-pre">const http = require('http');
+const { WebSocketServer } = require('ws');
+const PORT = process.env.PORT || 3000;
+let genSocket = null;
+const pending = new Map();
+let reqId = 0;
+
+const server = http.createServer(async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+  if (req.method === 'POST' && req.url.endsWith('/v1/chat/completions')) {
+    if (!genSocket) { res.writeHead(503); res.end(JSON.stringify({error:'Generator offline'})); return; }
+    let body = ''; req.on('data', c => body += c);
+    req.on('end', async () => {
+      const id = ++reqId;
+      genSocket.send(JSON.stringify({ id, body: JSON.parse(body) }));
+      const result = await new Promise(resolve => pending.set(id, { resolve }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    });
+    return;
+  }
+  res.writeHead(200); res.end('Perchance Generator Proxy Active.');
+});
+
+const wss = new WebSocketServer({ noServer: true });
+server.on('upgrade', (req, sock, head) => wss.handleUpgrade(req, sock, head, ws => wss.emit('connection', ws)));
+wss.on('connection', ws => {
+  genSocket = ws;
+  ws.on('message', msg => {
+    const { id, body } = JSON.parse(msg);
+    if (pending.has(id)) { pending.get(id).resolve(body); pending.delete(id); }
+  });
+  ws.on('close', () => { if (genSocket === ws) genSocket = null; });
+});
+server.listen(PORT, () => console.log(`Perchance proxy running at http://localhost:${PORT}`));</pre>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 1c. Cloudflare Workers -->
+            <div class="border border-zinc-800 bg-[#18181b]/50 rounded-xl overflow-hidden">
+                <button onclick="toggleAccordion('worker-accordion')" class="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-zinc-800/20 transition-all">
+                    <div class="flex items-center gap-3">
+                        <i data-lucide="server-cog" class="w-4 h-4 text-emerald-400"></i>
+                        <span class="text-xs font-black uppercase tracking-widest text-zinc-300">1c. Cloudflare Workers</span>
+                    </div>
+                    <i id="worker-accordion-arrow" data-lucide="chevron-down" class="w-4 h-4 text-zinc-500 transition-transform duration-300"></i>
+                </button>
+                <div id="worker-accordion-content" class="accordion-content border-t border-zinc-800/80 px-5 py-4 space-y-4 text-xs text-zinc-400 hidden">
+                    <div class="relative bg-zinc-950 rounded-xl border border-zinc-800 p-4">
+                        <div class="flex justify-between items-center mb-2 pb-2 border-b border-zinc-800/60">
+                            <span class="text-[9px] font-mono text-zinc-500">worker.js</span>
+                            <button onclick="copyWorkerCode()" class="px-2.5 py-1 bg-zinc-900 hover:bg-zinc-800 text-zinc-300 hover:text-white rounded border border-zinc-800 text-[10px] font-bold transition-all flex items-center gap-1.5 active:scale-[0.97]">
+                                <i data-lucide="copy" class="w-3 h-3"></i> Copy
+                            </button>
+                        </div>
+                        <pre id="worker-code-text" class="text-[10px] font-mono leading-relaxed overflow-x-auto max-h-32 text-zinc-400 scroll-hide select-all whitespace-pre">let genSocket = null;
+const pending = new Map();
+let reqId = 0;
+const cors = {"Access-Control-Allow-Origin":"*","Access-Control-Allow-Methods":"GET,POST,OPTIONS","Access-Control-Allow-Headers":"Content-Type,Authorization"};
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (request.method === "OPTIONS") return new Response(null, { headers: cors });
+    const upgrade = request.headers.get("Upgrade");
+    if (upgrade?.toLowerCase() === "websocket") {
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      server.accept(); genSocket = server;
+      server.addEventListener("message", e => {
+        const { id, body } = JSON.parse(e.data);
+        if (pending.has(id)) { pending.get(id).resolve(body); pending.delete(id); }
+      });
+      server.addEventListener("close", () => { if (genSocket === server) genSocket = null; });
+      return new Response(null, { status: 101, webSocket: client });
+    }
+    if (request.method === "POST" && url.pathname.endsWith("/v1/chat/completions")) {
+      if (!genSocket) return new Response(JSON.stringify({error:"Generator offline"}),{status:503,headers:cors});
+      const id = ++reqId;
+      const body = await request.json();
+      genSocket.send(JSON.stringify({ id, body }));
+      const result = await new Promise(resolve => pending.set(id, { resolve }));
+      return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json", ...cors } });
+    }
+    return new Response("Perchance Generator Proxy Active.", { headers: cors });
+  }
+};</pre>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 2. Extension -->
+            <div class="border border-zinc-800 bg-[#18181b]/50 rounded-xl overflow-hidden">
+                <button onclick="toggleAccordion('ext-accordion')" class="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-zinc-800/20 transition-all">
+                    <div class="flex items-center gap-3">
+                        <i data-lucide="blocks" class="w-4 h-4 text-orange-400"></i>
+                        <span class="text-xs font-black uppercase tracking-widest text-zinc-300">2. Extension Proxy Setup</span>
+                    </div>
+                    <i id="ext-accordion-arrow" data-lucide="chevron-down" class="w-4 h-4 text-zinc-500 transition-transform duration-300"></i>
+                </button>
+                <div id="ext-accordion-content" class="accordion-content border-t border-zinc-800/80 px-5 py-4 space-y-4 text-xs text-zinc-400 hidden">
+                    <p class="leading-relaxed text-[11px]">Perchance generators run in sandboxed iframes. Direct WebSocket access is blocked. This extension proxies messages out of the sandbox via the same postMessage channel the runtime layer uses.</p>
+                    <button onclick="downloadExtensionZip()" class="w-full bg-orange-600/20 hover:bg-orange-600/30 text-orange-400 border border-orange-500/30 font-bold py-3 px-4 rounded-xl text-xs transition-all flex items-center justify-center gap-2">
+                        <i data-lucide="download-cloud" class="w-4 h-4"></i> Download Extension ZIP
+                    </button>
+                    <p class="text-[9px] text-zinc-500 text-center italic">Unzip and load unpacked in chrome://extensions</p>
+                </div>
+            </div>
+
+            <!-- 3. Bridge Connection -->
+            <div class="border border-zinc-800 bg-[#18181b]/50 rounded-xl overflow-hidden">
+                <button onclick="toggleAccordion('credentials-accordion')" class="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-zinc-800/20 transition-all">
+                    <div class="flex items-center gap-3">
+                        <i data-lucide="key" class="w-4 h-4 text-violet-400"></i>
+                        <span class="text-xs font-black uppercase tracking-widest text-zinc-300">3. Bridge Connection</span>
+                    </div>
+                    <i id="credentials-accordion-arrow" data-lucide="chevron-down" class="w-4 h-4 text-zinc-500 transition-transform duration-300 rotate-180"></i>
+                </button>
+                <div id="credentials-accordion-content" class="accordion-content border-t border-zinc-800/80 px-5 py-4 space-y-4">
+                    <div class="space-y-2">
+                        <label class="text-[10px] font-bold text-zinc-500 uppercase">API Key</label>
+                        <div class="relative">
+                            <input id="api-key" type="password" placeholder="Your LLM API key…"
+                                   class="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-violet-500/50 transition-all font-mono text-zinc-200">
+                            <button onclick="toggleKeyVisibility()" class="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300">
+                                <i id="eye-icon" data-lucide="eye" class="w-4 h-4"></i>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="space-y-2">
+                        <label class="text-[10px] font-bold text-zinc-500 uppercase">Relay Endpoint (no ws/wss prefix)</label>
+                        <input id="edge-url" type="text" placeholder="e.g. localhost:3000 or tunnel.trycloudflare.com"
+                               class="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-violet-500/50 transition-all font-mono text-zinc-200 font-bold">
+                    </div>
+                    <div class="space-y-2">
+                        <label class="text-[10px] font-bold text-zinc-500 uppercase">Generator Model</label>
+                        <select id="model-select" class="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-violet-500/50 transition-all font-mono text-zinc-200">
+                            <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                            <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+                            <option value="gpt-4o">gpt-4o (OpenAI)</option>
+                            <option value="gpt-4o-mini">gpt-4o-mini (OpenAI)</option>
+                            <option value="claude-3-5-sonnet-20241022">claude-3-5-sonnet (Anthropic)</option>
+                        </select>
+                    </div>
+                    <button id="connect-btn" onclick="bridge.toggleConnection()"
+                            class="w-full bg-violet-600 hover:bg-violet-500 text-white font-bold py-3 px-4 rounded-xl text-sm transition-all shadow-lg shadow-violet-500/10 active:scale-[0.98] flex items-center justify-center gap-2">
+                        <i data-lucide="power" class="w-4 h-4"></i><span>Establish Bridge</span>
+                    </button>
+                    <div id="active-endpoint-container" class="hidden mt-3 p-3 bg-emerald-950/20 border border-emerald-900/50 rounded-xl space-y-2">
+                        <label class="text-[9px] font-bold text-emerald-500 uppercase tracking-wider">Active Endpoint</label>
+                        <div class="flex items-center gap-2">
+                            <input id="endpoint-url-display" type="text" readonly
+                                   class="w-full bg-zinc-950 border-none px-3 py-2 text-xs outline-none font-mono text-zinc-300 select-all focus:ring-1 focus:ring-emerald-500/30 rounded">
+                            <button onclick="copyEndpointUrl()" class="p-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-lg transition-all active:scale-95 flex-shrink-0">
+                                <i data-lucide="copy" class="w-4 h-4"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 4. Diagnostics -->
+            <div class="p-4 bg-zinc-900/50 border border-zinc-800 rounded-xl space-y-3 text-xs">
+                <button onclick="chatUI.openChat()" class="w-full bg-zinc-850 hover:bg-zinc-800 text-zinc-300 font-bold py-2.5 px-4 rounded-xl text-xs transition-all active:scale-[0.98] flex items-center justify-center gap-2">
+                    <i data-lucide="message-square" class="w-3.5 h-3.5 text-violet-400"></i>
+                    <span>Launch Diagnostic Chat</span>
+                </button>
+                <button onclick="PERCH_SS.setReloadMarker({test:true}); location.reload();" class="w-full bg-zinc-850 hover:bg-zinc-800 text-zinc-400 font-bold py-2 px-4 rounded-xl text-xs transition-all active:scale-[0.98] flex items-center justify-center gap-2">
+                    <i data-lucide="refresh-cw" class="w-3.5 h-3.5 text-zinc-500"></i>
+                    <span>Test initWithDataFromParentWindow Reload</span>
+                </button>
+            </div>
+
+        </div>
+    </section>
+
+    <!-- Right Column: Telemetry -->
+    <section class="flex-1 flex flex-col bg-[#050506] border-t lg:border-t-0 border-zinc-800 lg:h-[calc(100vh-64px)] overflow-hidden min-h-[500px]">
+        <div class="h-12 border-b border-zinc-800 flex items-center justify-between px-4 lg:px-6 bg-[#09090b]/40 shrink-0">
+            <div class="flex items-center gap-2">
+                <i data-lucide="activity" class="w-4 h-4 text-violet-400 animate-pulse"></i>
+                <span class="text-xs font-black uppercase tracking-widest text-zinc-400">Perchance Transport Stream</span>
+            </div>
+            <button onclick="bridge.clearLogs()" class="p-1.5 hover:bg-zinc-800 rounded text-zinc-400 hover:text-white transition-colors flex items-center gap-1.5 text-xs">
+                <i data-lucide="trash-2" class="w-3.5 h-3.5"></i> <span class="hidden sm:inline">Clear</span>
+            </button>
+        </div>
+        <div id="telemetry-output" class="flex-1 p-4 lg:p-6 overflow-y-auto space-y-4 scroll-hide text-zinc-200 font-mono">
+            <div id="empty-state" class="flex flex-col items-center justify-center h-full text-center opacity-40 font-sans">
+                <i data-lucide="network" class="w-12 h-12 text-zinc-500 mb-3 animate-pulse"></i>
+                <p class="text-sm">Perchance runtime layer active. Awaiting messages…</p>
+                <p class="text-xs text-zinc-600 mt-1 max-w-sm">postMessage commands, WS traffic and PERCH events appear here in real time.</p>
+            </div>
+        </div>
+    </section>
+</main>
+
+<!-- Chat Modal -->
+<div id="chat-modal" class="fixed inset-0 z-50 hidden bg-[#00000099] backdrop-blur-sm flex items-center justify-center p-4 sm:p-6">
+    <div class="bg-zinc-900 border border-zinc-700 rounded-2xl w-full max-w-2xl h-[80vh] max-h-[700px] flex flex-col shadow-2xl overflow-hidden">
+        <div class="h-14 border-b border-zinc-800 flex items-center justify-between px-5 bg-zinc-950 shrink-0">
+            <div class="flex items-center gap-3">
+                <div class="w-8 h-8 rounded bg-violet-500/20 flex items-center justify-center border border-violet-500/30">
+                    <i data-lucide="bot" class="w-4 h-4 text-violet-400"></i>
+                </div>
+                <div>
+                    <h3 class="font-bold text-sm text-zinc-200">Generator Endpoint Sandbox</h3>
+                    <p class="text-[10px] text-zinc-500 font-mono">POST /v1/chat/completions</p>
+                </div>
+            </div>
+            <button onclick="chatUI.closeChat()" class="p-2 text-zinc-500 hover:text-white hover:bg-zinc-800 rounded-lg transition-colors">
+                <i data-lucide="x" class="w-5 h-5"></i>
+            </button>
+        </div>
+        <div id="chat-messages" class="flex-1 overflow-y-auto p-5 space-y-4 bg-zinc-900 scroll-hide"></div>
+        <div class="p-4 border-t border-zinc-800 bg-zinc-950 shrink-0">
+            <form id="chat-form" onsubmit="chatUI.submitMessage(event)" class="relative flex items-center">
+                <input type="text" id="chat-input" placeholder="Test the generator endpoint…" autocomplete="off"
+                       class="w-full bg-zinc-900 border border-zinc-800 rounded-xl pl-4 pr-12 py-3.5 text-sm outline-none focus:ring-2 focus:ring-violet-500/50 transition-all text-zinc-200">
+                <button type="submit" class="absolute right-2 p-2 bg-violet-600 hover:bg-violet-500 text-white rounded-lg transition-colors shadow-lg active:scale-95" id="chat-send-btn">
+                    <i data-lucide="send" class="w-4 h-4"></i>
+                </button>
+            </form>
+        </div>
+    </div>
+</div>
+
+<div id="toast-container" class="fixed bottom-6 left-6 z-50 flex flex-col gap-2"></div>
+
+<script>
+// ════════════════════════════════════════════════════════════════
+// UI HELPERS
+// ════════════════════════════════════════════════════════════════
+const renderIcons = () => {
+    if (window.lucide?.createIcons) try { window.lucide.createIcons(); } catch(_) {}
+};
+
+function copyTextSecurely(text, msg) {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy') ? bridge.showToast(msg,'success') : bridge.showToast('Copy failed','error'); }
+    catch(_) { bridge.showToast('Copy blocked','error'); }
+    document.body.removeChild(ta);
+}
+const copyColabCode       = () => copyTextSecurely(document.getElementById('colab-code-text').textContent, 'Colab script copied!');
+const copyWorkerCode      = () => copyTextSecurely(document.getElementById('worker-code-text').textContent, 'Worker script copied!');
+const copyLocalServerCode = () => copyTextSecurely(document.getElementById('local-server-code-text').textContent, 'Server script copied!');
+const copyEndpointUrl     = () => copyTextSecurely(document.getElementById('endpoint-url-display').value, 'Endpoint URL copied!');
+
+function toggleKeyVisibility() {
+    const i = document.getElementById('api-key'), ic = document.getElementById('eye-icon');
+    i.type = i.type === 'password' ? 'text' : 'password';
+    ic.setAttribute('data-lucide', i.type === 'password' ? 'eye' : 'eye-off');
+    renderIcons();
+}
+
+function toggleAccordion(id) {
+    const c = document.getElementById(id+'-content'), a = document.getElementById(id+'-arrow');
+    c.classList.toggle('hidden');
+    a.classList.toggle('rotate-180');
+}
+
+// Update runtime status cards
+function updateRuntimeCards() {
+    document.getElementById('rt-parent').textContent = PERCH.parentWindow ? 'present' : 'none (top-level)';
+    document.getElementById('rt-marker').textContent = PERCH_SS.hasReloadMarker() ? 'set' : 'none';
+    document.getElementById('rt-model').textContent  = window.__perchance_model__ || document.getElementById('model-select')?.value || 'default';
+    navigator.serviceWorker?.getRegistration('./').then(reg => {
+        document.getElementById('rt-sw').textContent = reg
+            ? (reg.active ? 'active' : reg.installing ? 'installing' : 'waiting')
+            : 'none';
+    }).catch(() => { document.getElementById('rt-sw').textContent = 'blocked'; });
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    updateRuntimeCards();
+    document.getElementById('model-select')?.addEventListener('change', updateRuntimeCards);
+    setInterval(updateRuntimeCards, 5000);
+});
+
+// ════════════════════════════════════════════════════════════════
+// EXTENSION ZIP BUILDER
+// ════════════════════════════════════════════════════════════════
+async function downloadExtensionZip() {
+    try {
+        if (typeof window.JSZip === 'undefined') {
+            return bridge.showToast('JSZip CDN blocked by sandbox. Run locally to generate ZIP.','error');
+        }
+        const zip = new window.JSZip();
+
+        const manifest = {
+            manifest_version: 3,
+            name: "Perchance Generator Proxy",
+            version: "1.0.0",
+            description: "Proxies postMessage traffic out of Perchance generator sandboxed iframes for WebSocket bridging",
+            permissions: ["scripting"],
+            host_permissions: ["<all_urls>"],
+            background: { service_worker: "background.js" },
+            content_scripts: [{
+                matches: ["<all_urls>"],
+                match_origin_as_fallback: true,
+                match_about_blank: true,
+                all_frames: true,
+                js: ["content.js"],
+                run_at: "document_start"
+            }]
+        };
+
+        // content.js — listens for both CANVAS_APP_OUTBOUND (legacy compat)
+        // and perchance-generator source messages, routes them to the SW.
+        const contentJs = `
+// Perchance generator proxy — content script
+const isSandboxed = window.location.origin === "null" || window.self !== window.top;
+if (isSandboxed) {
+    window.addEventListener("message", (event) => {
+        const d = event.data;
+        if (!d || typeof d !== "object") return;
+        // Accept both the old canvas-proxy source and the perchance runtime source
+        if (d.source === "CANVAS_APP_OUTBOUND" || d.source === "perchance-generator") {
+            chrome.runtime.sendMessage({ type: "WS_COMMAND", action: d.action || d.type, payload: d.payload });
+        }
+    });
+    chrome.runtime.onMessage.addListener((message) => {
+        if (message.source === "BACKGROUND_WS_INBOUND") {
+            window.postMessage({ source: "CONTENT_SCRIPT_INBOUND", action: message.action, payload: message.payload }, "*");
+        }
+    });
+}
+`.trim();
+
+        const backgroundJs = `
+let ws = null;
+let heartbeat = null;
+
+function startHeartbeat() {
+    heartbeat = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping" }));
+    }, 20000);
+}
+
+chrome.runtime.onMessage.addListener((req, sender) => {
+    if (req.type !== "WS_COMMAND") return;
+    if (req.action === "CONNECT") {
+        const url = req.payload.url;
+        const proto = (url.includes("localhost") || url.includes("127.0.0.1")) ? "ws://" : "wss://";
+        try {
+            ws = new WebSocket(proto + url);
+            ws.onopen  = () => { startHeartbeat(); notifyTabs("WS_STATUS", { status: "CONNECTED" }); };
+            ws.onclose = () => { clearInterval(heartbeat); notifyTabs("WS_STATUS", { status: "DISCONNECTED" }); };
+            ws.onerror = () => notifyTabs("WS_STATUS", { status: "ERROR", message: "WebSocket error" });
+            ws.onmessage = (e) => notifyTabs("WS_MESSAGE", JSON.parse(e.data));
+        } catch(err) {
+            notifyTabs("WS_STATUS", { status: "ERROR", message: err.message });
+        }
+    } else if (req.action === "DISCONNECT" && ws) {
+        ws.close();
+    } else if (req.action === "SEND" && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(req.payload));
+    }
+});
+
+function notifyTabs(action, payload) {
+    chrome.tabs.query({ url: ["*://perchance.org/*", "*://*.perchance.org/*", "*://localhost/*"] }, tabs => {
+        tabs.forEach(tab => {
+            chrome.tabs.sendMessage(tab.id, { source: "BACKGROUND_WS_INBOUND", action, payload }).catch(() => {});
+        });
+    });
+}
+`.trim();
+
+        zip.file("manifest.json", JSON.stringify(manifest, null, 2));
+        zip.file("content.js", contentJs);
+        zip.file("background.js", backgroundJs);
+
+        const blob = await zip.generateAsync({ type: "blob" });
+        const url = URL.createObjectURL(blob);
+        const a = Object.assign(document.createElement("a"), { href: url, download: "perchance-proxy-extension.zip" });
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        bridge.showToast("Extension ZIP downloaded!", "success");
+    } catch(err) {
+        bridge.showToast("Error: " + err.message, "error");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// BRIDGE CORE
+// ════════════════════════════════════════════════════════════════
+const bridge = {
+    status: 'Disconnected',
+    currentEdgeUrl: '',
+    messageListenerAdded: false,
+
+    toggleConnection() {
+        let url = document.getElementById('edge-url').value.trim()
+            .replace(/^(wss?:\/\/|https?:\/\/)/i, '').replace(/\/+$/, '');
+        if (!url) { this.showToast('Enter a relay URL', 'error'); return; }
+        this.currentEdgeUrl = url;
+        this.status.startsWith('Connected') ? this.disconnect() : this.connect(url);
+    },
+
+    connect(url) {
+        this.updateStatus('Connecting…', 'yellow');
+        this.logEvent('PERCH_CONNECT', `Dispatching CONNECT to extension sandbox bypass…`);
+
+        window.postMessage({ source: 'CANVAS_APP_OUTBOUND', action: 'CONNECT', payload: { url } }, '*');
+
+        if (!this.messageListenerAdded) {
+            // Note: the top-level message handler (defined in the PERCH runtime block
+            // above) routes CONTENT_SCRIPT_INBOUND messages to bridge.onExtensionConnected
+            // / bridge.onWsMessage.  No second addEventListener needed here.
+            this.messageListenerAdded = true;
+        }
+    },
+
+    disconnect() {
+        window.postMessage({ source: 'CANVAS_APP_OUTBOUND', action: 'DISCONNECT' }, '*');
+        this.updateStatus('Disconnected', 'red');
+        document.getElementById('active-endpoint-container')?.classList.add('hidden');
+    },
+
+    // Called by the top-level message dispatcher in the PERCH runtime block.
+    onExtensionConnected() {
+        this.updateStatus('Connected to Bridge', 'green');
+        this.logEvent('PERCH_EDGE_CONNECTED', 'WebSocket relay established via Perchance extension proxy.');
+        this.showToast('Bridge established.', 'success');
+        const proto = (this.currentEdgeUrl.includes('localhost') || this.currentEdgeUrl.includes('127.0.0.1')) ? 'http://' : 'https://';
+        const display = document.getElementById('endpoint-url-display');
+        if (display) display.value = `${proto}${this.currentEdgeUrl}/v1/chat/completions`;
+        document.getElementById('active-endpoint-container')?.classList.remove('hidden');
+    },
+
+    onExtensionDisconnected(pl) {
+        if (pl.status === 'ERROR') this.showToast('WS error: ' + (pl.message||'unknown'), 'error');
+        this.updateStatus('Disconnected', 'red');
+        document.getElementById('active-endpoint-container')?.classList.add('hidden');
+    },
+
+    async onWsMessage(payload) {
+        if (payload.type === 'ping') return;
+        const { id, body } = payload;
+        this.logEvent('PERCH_INBOUND', { id, body });
+        try {
+            const key   = document.getElementById('api-key').value.trim();
+            const model = document.getElementById('model-select').value;
+            const result = await this.queryModel(key, model, body);
+            this.logEvent('PERCH_OUTBOUND', { id, result });
+            window.postMessage({ source: 'CANVAS_APP_OUTBOUND', action: 'SEND', payload: { id, body: result } }, '*');
+        } catch(err) {
+            this.logEvent('PERCH_ERROR', { error: err.message });
+            window.postMessage({ source: 'CANVAS_APP_OUTBOUND', action: 'SEND', payload: { id, body: { error: err.message } } }, '*');
+        }
+    },
+
+    async fetchWithBackoff(url, opts) {
+        const delays = [500, 1500, 3000];
+        let last;
+        for (let i = 0; i <= delays.length; i++) {
+            try {
+                const res = await fetch(url, opts);
+                if (res.ok) return res;
+                const j = await res.json().catch(() => ({}));
+                last = new Error(j.error?.message || `HTTP ${res.status}`);
+            } catch(e) { last = e; }
+            if (i < delays.length) await new Promise(r => setTimeout(r, delays[i]));
+        }
+        throw last;
+    },
+
+    async queryModel(key, model, chatBody) {
+        // ── Gemini models ───────────────────────────────────────────
+        if (model.startsWith('gemini')) {
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
+            const contents = (chatBody.messages || []).map(m => ({
+                role: m.role === 'assistant' ? 'model' : 'user',
+                parts: [{ text: m.content }]
+            }));
+            const res  = await this.fetchWithBackoff(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ contents }) });
+            const data = await res.json();
+            const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+            return this._wrapOpenAI(text, model);
+        }
+        // ── OpenAI-compatible models (gpt-*, claude via proxy, etc.) ──
+        const res  = await this.fetchWithBackoff('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
+            body: JSON.stringify({ ...chatBody, model })
+        });
+        return await res.json();
+    },
+
+    _wrapOpenAI(text, model) {
+        return {
+            id: 'chatcmpl-' + Math.random().toString(36).substr(2,9),
+            object: 'chat.completion',
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }]
+        };
+    },
+
+    updateStatus(text, color) {
+        const dot = document.getElementById('header-status-dot');
+        const txt = document.getElementById('header-status-text');
+        const btn = document.getElementById('connect-btn');
+        this.status = text;
+        if (txt) txt.textContent = text;
+        const colors = { red:'bg-red-500 animate-pulse', yellow:'bg-yellow-500 animate-pulse', green:'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]' };
+        if (dot) dot.className = `w-2 h-2 rounded-full ${colors[color]||'bg-zinc-500'}`;
+        if (btn) {
+            if (text.startsWith('Connected')) {
+                btn.className = 'w-full bg-red-600 hover:bg-red-500 text-white font-bold py-3 px-4 rounded-xl text-sm transition-all flex items-center justify-center gap-2';
+                btn.innerHTML = '<i data-lucide="power-off" class="w-4 h-4"></i><span>Sever Bridge</span>';
+            } else {
+                btn.className = 'w-full bg-violet-600 hover:bg-violet-500 text-white font-bold py-3 px-4 rounded-xl text-sm transition-all flex items-center justify-center gap-2';
+                btn.innerHTML = '<i data-lucide="power" class="w-4 h-4"></i><span>Establish Bridge</span>';
+            }
+        }
+        renderIcons();
+    },
+
+    logEvent(type, rawData) {
+        const container = document.getElementById('telemetry-output');
+        document.getElementById('empty-state')?.remove();
+        const card = document.createElement('div');
+        card.className = 'mb-4 border-l-2 border-violet-500 bg-zinc-900/40 p-4 rounded-r-xl border border-zinc-800/80';
+        const out = typeof rawData === 'object' ? JSON.stringify(rawData, null, 2) : rawData;
+        const safe = String(out).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        card.innerHTML = `
+            <div class="flex justify-between items-center text-[10px] text-zinc-500 mb-2 font-mono">
+                <span class="font-bold text-zinc-300">➜ ${type}</span>
+                <span>${new Date().toLocaleTimeString()}</span>
+            </div>
+            <pre class="text-xs text-zinc-300 font-mono overflow-x-auto select-all max-h-60 whitespace-pre-wrap">${safe}</pre>`;
+        container?.prepend(card);
+    },
+
+    clearLogs() {
+        const c = document.getElementById('telemetry-output');
+        if (c) c.innerHTML = `<div id="empty-state" class="flex flex-col items-center justify-center h-full text-center opacity-40 font-sans">
+            <i data-lucide="network" class="w-12 h-12 text-zinc-500 mb-3 animate-pulse"></i>
+            <p class="text-sm">Perchance runtime layer active. Awaiting messages…</p></div>`;
+        renderIcons();
+    },
+
+    showToast(message, type='info') {
+        const container = document.getElementById('toast-container');
+        if (!container) return;
+        const styles = { info:'bg-zinc-900 border-zinc-700 text-zinc-300', success:'bg-emerald-950 border-emerald-800 text-emerald-400', error:'bg-red-950 border-red-800 text-red-400' };
+        const icons  = { info:'info', success:'check-circle-2', error:'alert-triangle' };
+        const toast  = document.createElement('div');
+        toast.className = `flex items-center gap-3 px-4 py-3 rounded-xl border text-xs shadow-xl min-w-80 ${styles[type]}`;
+        toast.innerHTML = `<i data-lucide="${icons[type]}" class="w-4 h-4 shrink-0"></i><span class="font-medium">${message}</span>`;
+        container.appendChild(toast); renderIcons();
+        setTimeout(() => { toast.remove(); }, 4000);
+    }
+};
+
+// ════════════════════════════════════════════════════════════════
+// CHAT UI
+// ════════════════════════════════════════════════════════════════
+const chatUI = {
+    history: [],
+    openChat() {
+        document.getElementById('chat-modal').classList.remove('hidden');
+        if (!this.history.length) {
+            this.history = [{ role:'system', content:'You are a Perchance generator assistant. Keep responses concise.' }];
+            document.getElementById('chat-messages').innerHTML = '';
+            this.appendMessage('assistant', 'Sandbox ready. Sends real POST requests to /v1/chat/completions.');
+        }
+        setTimeout(() => document.getElementById('chat-input').focus(), 100);
+    },
+    closeChat() { document.getElementById('chat-modal').classList.add('hidden'); },
+    appendMessage(role, text) {
+        const c = document.getElementById('chat-messages');
+        const d = document.createElement('div');
+        d.className = `flex ${role==='user'?'justify-end':'justify-start'}`;
+        const b = document.createElement('div');
+        b.className = `p-3.5 rounded-2xl max-w-[85%] text-sm leading-relaxed shadow-sm ${role==='user'?'bg-violet-600 text-white rounded-tr-sm':'bg-zinc-800 text-zinc-200 border border-zinc-700 rounded-tl-sm'}`;
+        b.textContent = text; d.appendChild(b); c.appendChild(d); c.scrollTop = c.scrollHeight;
+    },
+    showLoading() {
+        const c = document.getElementById('chat-messages');
+        const d = document.createElement('div'); d.id = 'chat-loading';
+        d.className = 'flex justify-start';
+        d.innerHTML = '<div class="p-4 rounded-2xl bg-zinc-800 border border-zinc-700 rounded-tl-sm"><div class="dot-flashing ml-3"></div></div>';
+        c.appendChild(d); c.scrollTop = c.scrollHeight;
+    },
+    hideLoading() { document.getElementById('chat-loading')?.remove(); },
+    async submitMessage(e) {
+        e.preventDefault();
+        const inp = document.getElementById('chat-input');
+        const btn = document.getElementById('chat-send-btn');
+        const text = inp.value.trim(); if (!text) return;
+        inp.value = ''; inp.disabled = btn.disabled = true;
+        this.appendMessage('user', text);
+        this.history.push({ role:'user', content: text });
+        if (!bridge.currentEdgeUrl || !bridge.status.startsWith('Connected')) {
+            this.appendMessage('assistant', '⚠️ Bridge disconnected. Establish connection first.');
+            inp.disabled = btn.disabled = false; return;
+        }
+        this.showLoading();
+        const model = document.getElementById('model-select').value;
+        const proto = (bridge.currentEdgeUrl.includes('localhost') || bridge.currentEdgeUrl.includes('127.0.0.1')) ? 'http://' : 'https://';
+        const target = `${proto}${bridge.currentEdgeUrl}/v1/chat/completions`;
+        try {
+            bridge.logEvent('DIAG_REQUEST', { target, model });
+            const res = await fetch(target, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ model, messages: this.history }) });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
+            this.hideLoading();
+            const reply = data.choices?.[0]?.message?.content || 'No content returned.';
+            bridge.logEvent('DIAG_RESPONSE', { reply });
+            this.appendMessage('assistant', reply);
+            this.history.push({ role:'assistant', content: reply });
+        } catch(err) {
+            this.hideLoading();
+            this.appendMessage('assistant', '⚠️ Error: ' + err.message);
+            bridge.logEvent('DIAG_ERROR', { error: err.message });
+        } finally { inp.disabled = btn.disabled = false; inp.focus(); }
+    }
+};
+
+window.onload = () => renderIcons();
+</script>
+</body>
+</html>
